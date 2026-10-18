@@ -13,12 +13,37 @@ Codex 负责规划、审查和验收，DeepSeek Harness 执行明确、有限的
 ./Install-Skill.ps1  # 可选：当前用户级技能；已有同名技能时拒绝覆盖
 ./Set-Token.ps1     # 在自己的交互终端隐藏输入，不发到聊天
 ./dsh-task.ps1 -Command doctor
+./dsh-task.ps1 -Command network-check  # 可选：无 Token、无模型调用的联网检查
 ```
 
 Setup 安装本地 `.venv` 和 `node_modules`，不修改系统 Python 或安装全局软件；使用锁定依赖，npm 生命周期脚本关闭。
 Node/PowerShell 的机器路径仅写入忽略的 `.state/runtime-launch.json`，安装技能的路径映射也只在本机生成。
 用户级技能目录是 `$HOME/.agents/skills/dsh-collaboration`；新技能未被发现时重启 Codex。
 自然语言“用 DSH 协作模式”“启用 DSH”或 `$dsh-collaboration` 请求协作。只有启用、没有具体任务时，不调用付费模型。
+
+## 网络连接故障
+
+`doctor` 只初始化本地运行时；凭据存在与否、初始化成功都不证明 API 网络可达。
+`network-check` 使用同一锁定 Node 和 DSH 代理实现，向官方 Messages 地址发送不带凭据的 HEAD 请求；
+HTTP 401 表示已连通接口，不表示认证失败。该检查不会创建模型任务，也不验证账户余额或 Token。
+
+若任务出现 `TRANSPORT` 或连接超时，先运行 `network-check`。桥接保留调用方显式设置的
+`HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY`、`NO_PROXY`；也可在忽略的 `.state/network.json`
+配置当前机器已有、可信的 HTTP(S) 代理，例如：
+
+```json
+{
+  "HTTP_PROXY": "http://127.0.0.1:7890",
+  "HTTPS_PROXY": "http://127.0.0.1:7890",
+  "NO_PROXY": "localhost,127.0.0.1,::1"
+}
+```
+
+请换成自己实际使用的代理地址。环境变量按名称优先于本机文件，显式空值禁用该项；
+不读取项目 `.env` 或 Windows 系统代理，不自动探测、选择代理，不修改系统 DNS/路由。
+无设置时保持直连；不支持的协议或无效配置直接报错，不静默改为直连。检测失败也不会自动改网络配置或重派模型任务。
+代理值不会显示在诊断输出中；含代理密码时它仍可被运行时及其子命令读取，勿提交本机配置。
+代理机制见 [DSH 官方网络指南](https://github.com/deepseek-ai/deepseek-harness/blob/master/docs/user/guide/network-proxy.md)。
 
 ## 派发与返工
 
@@ -31,6 +56,14 @@ Node/PowerShell 的机器路径仅写入忽略的 `.state/runtime-launch.json`�
 ```
 
 返回 `model_completed=true` 只说明执行结束；`accepted_by_coordinator` 永远为 false，主助手必须独立审查差异和测试。
+失败时 `result.json` 保留 `error.code` 和脱敏、限长的 `error.message`；`progress.jsonl`
+保留重试序号、上限、等待时间和错误摘要。达到输出上限也明确记录未完成原因，不能合入部分编辑。
+`OUTPUT_TOKEN_LIMIT` / `finish_reason=max-tokens` 表示单次生成截断：思考与最终回答共用
+`config.json` 中的 `max_output_tokens_per_request`，与账户余额无关；只有服务返回 `QUOTA`
+才是账户额度错误。默认单响应上限为 65536 tokens，修正了旧版 8192 过低、常在思考结束前被截断的问题。
+结果与 `doctor` 会显示生效的请求上限、步数和超时；调整输出上限不会自动重派任务、修改沙箱、放宽步数或延长超时。
+更高上限允许一次请求产生更多输出，用量仍以服务记录为准。
+参数定义见 [DeepSeek 官方 API 文档](https://api-docs.deepseek.com/api/create-chat-completion/)。
 SDK 不支持跨进程采用已有会话；返工新建会话，带上最多 12000 字符旧报告和当前工作区文件。
 一次只派发一个任务。失败、取消、超时均可能留下部分编辑；停止不回滚。残留锁必须先确认无活动任务，再人工处理。
 
@@ -39,7 +72,7 @@ SDK 不支持跨进程采用已有会话；返工新建会话，带上最多 120
 - 官方 Node DSH `@deepseek-ai/dsh@0.2.0-rc.2`、Python SDK `0.1.5rc1`；不使用 SDK 捆绑旧 SEA 运行时。
 - `deepseek-flash`，官方 Messages 根地址 `https://api.deepseek.com/anthropic`；修改端点被拒绝。
 - `workspace-write` + `never`（拒绝审批升级，不是自动批准）。不自动 fallback 为全权限。
-- 600 秒超时，8192 单响应 token，12 模型步软保护；不是精准账单预算，通知时序、输入、重试、缓存或压缩可能影响费用。
+- 600 秒超时，65536 单响应 token（包括思考与回答），12 模型步软保护；不是精准账单预算，通知时序、输入、重试、缓存或压缩可能影响费用。
 - Windows Job 在超时/取消/父进程退出时停止工作进程及其后代。
 - 禁用额外会话日志上传、遥测、插件清单上传、网页工具及子 Agent/循环目标工具。
 

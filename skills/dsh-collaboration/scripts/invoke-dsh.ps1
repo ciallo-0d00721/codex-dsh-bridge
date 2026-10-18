@@ -1,5 +1,5 @@
 param(
-    [ValidateSet('doctor', 'run')][string]$Command = 'doctor',
+    [ValidateSet('doctor', 'network-check', 'run')][string]$Command = 'doctor',
     [string]$Workspace,
     [string]$TaskFile,
     [string]$ContinueFrom
@@ -18,7 +18,7 @@ if (-not [System.IO.Path]::IsPathRooted($bridgeRoot)) { throw 'The DSH bridge pa
 $python = Join-Path $bridgeRoot '.venv\Scripts\python.exe'
 $bridge = Join-Path $bridgeRoot 'bridge.py'
 foreach ($path in @($python, $bridge, (Join-Path $bridgeRoot 'safe-profile.patch.yml'))) {
-    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "DSH installation is missing: $path. No automatic reinstall or permission fallback." }
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "No automatic reinstall or permission fallback. DSH installation is missing: $path." }
 }
 $arguments = @($bridge, $Command)
 if ($Command -eq 'run') {

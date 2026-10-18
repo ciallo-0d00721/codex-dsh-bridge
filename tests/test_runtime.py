@@ -28,8 +28,18 @@ class RuntimeIntegrationTests(unittest.TestCase):
                 def do_POST(self):
                     body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
                     requests.append({"path": self.path, "body": body})
+                    if mode in {"error", "quota"}:
+                        data = json.dumps({"type": "error", "error": {
+                            "type": "insufficient_quota_error" if mode == "quota" else "invalid_request_error",
+                            "message": "Offline synthetic quota exhausted" if mode == "quota" else "Offline synthetic request failure"}}).encode()
+                        self.send_response(402 if mode == "quota" else 400)
+                        self.send_header("Content-Type", "application/json")
+                        self.send_header("Content-Length", str(len(data)))
+                        self.end_headers()
+                        self.wfile.write(data)
+                        return
                     tools = [{"name": t["name"], "parameters": t["input_schema"]} for t in body.get("tools", [])]
-                    tool_use = (mode not in {"text", "resume"} and len(requests) == 1) or (mode == "escalate" and len(requests) == 2)
+                    tool_use = (mode not in {"text", "resume", "max-tokens"} and len(requests) == 1) or (mode == "escalate" and len(requests) == 2)
                     if tool_use:
                         tool_name = "pwsh" if mode.startswith("shell") else "write"
                         tool = next(t for t in tools if t.get("name") == tool_name)
@@ -51,7 +61,7 @@ class RuntimeIntegrationTests(unittest.TestCase):
                     else:
                         block = {"type": "text", "text": ""}
                         delta = {"type": "text_delta", "text": "OFFLINE_RUNTIME_RESPONSE_OK"}
-                        reason = "end_turn"
+                        reason = "max_tokens" if mode == "max-tokens" else "end_turn"
                     events = [
                         ("message_start", {"type": "message_start", "message": {"id": "msg_offline", "type": "message",
                          "role": "assistant", "model": "deepseek-flash", "content": [], "stop_reason": None,
@@ -82,6 +92,36 @@ class RuntimeIntegrationTests(unittest.TestCase):
                 with bridge.managed_harness(options) as harness:
                     result = harness.run("Execute the local offline integration fixture.",
                                          session_id="offline-test-session", on_notification=notifications.append)
+                self.assertTrue(requests)
+                for request in requests:
+                    self.assertEqual(request["body"]["max_tokens"], settings["max_output_tokens_per_request"])
+                    self.assertEqual(request["body"]["output_config"]["effort"], "high")
+                if mode == "max-tokens":
+                    self.assertEqual(result.finish_reason, "max-tokens")
+                    output = bridge.worker_result(result, workspace, 1, "offline-test-not-a-real-key", settings)
+                    self.assertEqual(output["error"]["code"], "OUTPUT_TOKEN_LIMIT")
+                    self.assertIn("65536", output["error"]["message"])
+                    self.assertFalse(output["model_completed"])
+                    self.assertFalse(output["accepted_by_coordinator"])
+                    self.assertEqual(len(requests), 1, "Output truncation must not automatically retry")
+                    return
+                if mode == "quota":
+                    self.assertEqual(result.finish_reason, "error")
+                    output = bridge.worker_result(result, workspace, 1, "offline-test-not-a-real-key", settings)
+                    self.assertEqual(output["error"]["code"], "QUOTA")
+                    self.assertFalse(output["model_completed"])
+                    self.assertEqual(len(requests), 1, "Account quota errors must not automatically retry")
+                    return
+                if mode == "error":
+                    self.assertEqual(result.finish_reason, "error")
+                    output = bridge.worker_result(result, workspace, 1, "offline-test-not-a-real-key")
+                    self.assertFalse(output["model_completed"])
+                    self.assertIn("Offline synthetic request failure", output["error"]["message"])
+                    self.assertTrue(output["error"]["code"])
+                    progress = [bridge.progress_record(n) for n in notifications]
+                    self.assertTrue(any(p.get("error") == output["error"] for p in progress))
+                    self.assertEqual(len(requests), 1, "Non-retryable errors must not be retried")
+                    return
                 if mode == "resume":
                     with bridge.managed_harness(options) as harness:
                         result = harness.run("Previous worker report: OFFLINE_RUNTIME_RESPONSE_OK. Inspect the existing files and do the new rework task.",
@@ -125,6 +165,15 @@ class RuntimeIntegrationTests(unittest.TestCase):
 
     def test_real_runtime_text_and_event_return(self):
         self.exercise("text")
+
+    def test_real_runtime_preserves_terminal_provider_error(self):
+        self.exercise("error")
+
+    def test_real_runtime_output_cap_is_distinct_from_account_quota(self):
+        self.exercise("max-tokens")
+
+    def test_real_runtime_account_quota_remains_a_quota_error(self):
+        self.exercise("quota")
 
     def test_real_runtime_writes_inside_workspace(self):
         self.exercise("write")

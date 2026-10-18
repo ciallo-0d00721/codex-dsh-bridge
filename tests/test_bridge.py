@@ -112,7 +112,8 @@ class BridgeUnitTests(unittest.TestCase):
         self.assertEqual(opts["profile"], "sdk")
         self.assertEqual(opts["cwd"], opts["runtime_cwd"])
         self.assertEqual(opts["model"], "deepseek-flash")
-        self.assertEqual(opts["max_tokens"], 8192)
+        self.assertEqual(opts["max_tokens"], 65536)
+        self.assertEqual(opts["reasoning_effort"], "high")
 
     def test_step_start_is_counted(self):
         notification = SimpleNamespace(method="session.event", payload={"event": {"type": "step/start"}})
@@ -126,6 +127,63 @@ class BridgeUnitTests(unittest.TestCase):
     def test_other_events_do_not_consume_step_limit(self):
         for method, event in (("session.status", {}), ("session.event", {"type": "assistant/message"})):
             notification = SimpleNamespace(method=method, payload={"event": event})
+            self.assertEqual(bridge.count_model_step(notification, 3, 12), 3)
+
+    def test_failed_worker_preserves_terminal_error_and_redacts_both_fields(self):
+        key = "fixture-active-credential"
+        events = [{"type": "turn/end", "data": {"reason": {"kind": "error", "error": {
+            "code": key, "message": "Failed: " + key}}}}]
+        result = SimpleNamespace(session_id="test", finish_reason="error", final_response="", events=events)
+        output = bridge.worker_result(result, Path("test"), 1, key)
+        self.assertEqual(output["error"], {"code": "[REDACTED]", "message": "Failed: [REDACTED]"})
+        self.assertFalse(output["model_completed"])
+        self.assertFalse(output["accepted_by_coordinator"])
+
+    def test_worker_output_limit_has_explicit_failure(self):
+        result = SimpleNamespace(session_id="test", finish_reason="max-tokens", final_response="partial", events=[])
+        output = bridge.worker_result(result, Path("test"), 1, "", bridge.config())
+        self.assertFalse(output["model_completed"])
+        self.assertEqual(output["error"]["code"], "OUTPUT_TOKEN_LIMIT")
+        self.assertIn("65536", output["error"]["message"])
+        self.assertEqual(output["limits"]["max_output_tokens_per_request"], 65536)
+        self.assertEqual(output["limits"]["max_model_steps"], 12)
+        self.assertEqual(output["limits"]["timeout_seconds"], 600)
+        self.assertEqual(output["final_response"], "partial")
+
+    def test_account_quota_error_stays_distinct_from_output_limit(self):
+        events = [{"type": "turn/end", "data": {"reason": {"kind": "error", "error": {
+            "code": "QUOTA", "message": "Synthetic account quota exhausted"}}}}]
+        result = SimpleNamespace(session_id="test", finish_reason="error", final_response="", events=events)
+        output = bridge.worker_result(result, Path("test"), 1, "", bridge.config())
+        self.assertEqual(output["error"]["code"], "QUOTA")
+        self.assertFalse(output["model_completed"])
+        self.assertNotEqual(output["error"]["code"], "OUTPUT_TOKEN_LIMIT")
+
+    def test_successful_worker_remains_unaccepted_without_error(self):
+        result = SimpleNamespace(session_id="test", finish_reason="completed", final_response="done", events=[])
+        output = bridge.worker_result(result, Path("test"), 1, "")
+        self.assertTrue(output["model_completed"])
+        self.assertFalse(output["accepted_by_coordinator"])
+        self.assertNotIn("error", output)
+
+    def test_retry_progress_keeps_bounded_failure_without_arbitrary_payloads(self):
+        key = "fixture-active-credential"
+        notification = SimpleNamespace(method="session.event", payload={"event": {"type": "llm/retry", "data": {
+            "retry": 2, "maxRetries": 5, "delayMs": 1000, "private_payload": "not-for-progress",
+            "failure": {"code": "TRANSPORT", "message": "x" + key + "y" * 5000, "headers": "private-header"}}}})
+        output = bridge.progress_record(notification, key)
+        self.assertEqual(output["error"]["code"], "TRANSPORT")
+        self.assertEqual(output["retry"], 2)
+        self.assertEqual(output["maxRetries"], 5)
+        self.assertLessEqual(len(output["error"]["message"]), 2000)
+        for value in (key, "not-for-progress", "private-header"):
+            self.assertNotIn(value, json.dumps(output))
+
+    def test_malformed_notifications_do_not_crash_progress_or_step_counter(self):
+        for payload in (None, [], {"event": None}, {"event": {"data": None}},
+                        {"event": {"type": "assistant/message", "data": []}}):
+            notification = SimpleNamespace(method="session.event", payload=payload)
+            self.assertIsInstance(bridge.progress_record(notification), dict)
             self.assertEqual(bridge.count_model_step(notification, 3, 12), 3)
 
     def test_windows_job_stops_descendant_processes(self):

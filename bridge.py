@@ -17,6 +17,9 @@ import subprocess
 import sys
 import time
 import uuid
+from urllib.parse import urlsplit
+
+from error_report import describe_incomplete, extract_failure
 
 BASE = Path(__file__).resolve().parent
 STATE = BASE / ".state"
@@ -40,7 +43,8 @@ def count_model_step(notification, current: int, limit: int) -> int:
     # The pinned 0.2.0-rc.2 runtime emits step/start, not assistant/attempt.
     # Count before the committed message; this remains a best-effort event guard.
     if notification.method == "session.event":
-        event = notification.payload.get("event", {})
+        payload = notification.payload if isinstance(notification.payload, dict) else {}
+        event = payload.get("event", {})
         if isinstance(event, dict) and event.get("type") == "step/start":
             current += 1
             if current > limit:
@@ -232,9 +236,40 @@ def clean_environment() -> dict[str, str]:
                "programfiles", "programfiles(x86)", "programw6432", "number_of_processors", "os",
                "processor_architecture"}
     env = {k: v for k, v in os.environ.items() if k.lower() in allowed}
+    env.update(network_environment())
     env.update(PYTHONIOENCODING="utf-8", PYTHONUTF8="1", DSH_TELEMETRY_DISABLED="1",
                DSH_TELEMETRY_MODE="DISABLED", DSH_PERMISSION_MODE="workspace-write")
     return env
+
+
+def network_environment() -> dict[str, str]:
+    """Only operator-owned proxy settings survive credential/environment scrubbing."""
+    names = {"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"}
+    path = STATE / "network.json"
+    local = json.loads(path.read_text(encoding="utf-8-sig")) if path.exists() else {}
+    if not isinstance(local, dict) or set(local) - names:
+        raise BridgeError("Local network.json must contain only standard proxy variable names.")
+    inherited = {k.upper(): v for k, v in os.environ.items() if k.upper() in names}
+    result = {}
+    for name in names:
+        value = inherited.get(name, local.get(name, ""))
+        if not isinstance(value, str) or any(c in value for c in "\r\n\0"):
+            raise BridgeError(f"Invalid {name} setting; proxy values are not printed.")
+        value = value.strip()
+        if not value:
+            continue
+        if name != "NO_PROXY":
+            try:
+                parsed = urlsplit(value)
+                valid = (parsed.scheme in {"http", "https"} and bool(parsed.hostname) and parsed.port != 0
+                         and not any(c.isspace() for c in value) and "\\" not in value
+                         and parsed.path in {"", "/"} and not parsed.query and not parsed.fragment)
+            except ValueError:
+                valid = False
+            if not valid:
+                raise BridgeError(f"Invalid {name}: an HTTP(S) proxy is required; no direct fallback.")
+        result[name] = value
+    return result
 
 
 def harness_options(workspace: Path, home: Path, settings: dict, key: str | None = None) -> dict:
@@ -267,6 +302,60 @@ def managed_harness(options: dict):
                         stream.close()
 
 
+def execution_limits(settings: dict) -> dict:
+    return {name: settings[name] for name in ("max_output_tokens_per_request", "max_model_steps", "timeout_seconds")}
+
+
+def progress_record(notification, key: str = "") -> dict:
+    """Keep bounded diagnostic fields, never full provider or model payloads."""
+    item = {"time": round(time.time(), 3), "method": notification.method}
+    payload = notification.payload if isinstance(notification.payload, dict) else {}
+    if notification.method == "session.event":
+        event = payload.get("event")
+        if not isinstance(event, dict):
+            return item
+        event_type = event.get("type")
+        item["event_type"] = redact(event_type, key)[:80] if isinstance(event_type, str) else None
+        data = event.get("data")
+        data = data if isinstance(data, dict) else {}
+        if event_type == "turn/end" and isinstance(data.get("reason"), dict):
+            reason = data["reason"].get("kind")
+            if isinstance(reason, str):
+                item["finish_reason"] = redact(reason, key)[:80]
+        usage = data.get("usage")
+        if isinstance(usage, dict):
+            item["usage"] = {k: v for k, v in usage.items() if type(v) in (int, float)}
+        if event_type == "llm/retry":
+            for field in ("retry", "maxRetries", "delayMs"):
+                if type(data.get(field)) in (int, float):
+                    item[field] = data[field]
+            events = [{"type": "turn/end", "data": {"reason": {"kind": "error", "error": data.get("failure")}}}]
+        else:
+            events = [event]
+        failure = extract_failure(events, lambda value: redact(value, key))
+        if failure:
+            item["error"] = failure
+    elif notification.method == "session.status":
+        status = payload.get("status")
+        item["status"] = redact(status, key)[:80] if isinstance(status, str) else None
+    return item
+
+
+def worker_result(result, workspace: Path, steps: int, key: str, settings: dict | None = None) -> dict:
+    output = {"type": "result", "session_id": result.session_id, "workspace": str(workspace),
+              "finish_reason": result.finish_reason, "model_completed": result.finish_reason == "completed",
+              "accepted_by_coordinator": False, "model_steps": steps,
+              "final_response": redact(result.final_response, key)}
+    if settings is not None:
+        output["limits"] = execution_limits(settings)
+    if not output["model_completed"]:
+        failure = extract_failure(result.events, lambda value: redact(value, key))
+        reason = redact(result.finish_reason, key) if isinstance(result.finish_reason, str) else None
+        limit = settings.get("max_output_tokens_per_request") if settings else None
+        output["error"] = failure or describe_incomplete(reason, limit)
+    return output
+
+
 def worker() -> int:
     # Block until the supervisor has attached this process to its Windows Job.
     request = json.loads(sys.stdin.read())
@@ -282,15 +371,7 @@ def worker() -> int:
         def observe(notification):
             nonlocal steps
             steps = count_model_step(notification, steps, settings["max_model_steps"])
-            item = {"time": round(time.time(), 3), "method": notification.method}
-            if notification.method == "session.event":
-                event = notification.payload.get("event", {})
-                item["event_type"] = event.get("type")
-                usage = event.get("data", {}).get("usage")
-                if isinstance(usage, dict):
-                    item["usage"] = {k: v for k, v in usage.items() if type(v) in (int, float)}
-            if notification.method == "session.status":
-                item["status"] = notification.payload.get("status")
+            item = progress_record(notification, key)
             with (run_dir / "progress.jsonl").open("a", encoding="utf-8") as f:
                 f.write(json.dumps(item, ensure_ascii=False) + "\n")
 
@@ -302,10 +383,7 @@ def worker() -> int:
                 + request["task"])
         with managed_harness(harness_options(workspace, home, settings, key)) as harness:
             result = harness.run(task, session_id=request["session_id"], on_notification=observe)
-        output = {"type": "result", "session_id": result.session_id, "workspace": str(workspace),
-                  "finish_reason": result.finish_reason, "model_completed": result.finish_reason == "completed",
-                  "accepted_by_coordinator": False, "model_steps": steps,
-                  "final_response": redact(result.final_response, key)}
+        output = worker_result(result, workspace, steps, key, settings)
         print(json.dumps(output, ensure_ascii=False), flush=True)
         return 0 if output["model_completed"] else 2
     except Exception as exc:
@@ -417,13 +495,32 @@ def doctor() -> None:
                       "credential_stored": TOKEN.is_file(), "paid_model_tasks": 0,
                       "model": settings["model"], "workspace_root": str(path.parent),
                       "sandbox": "workspace-write", "approval": "never (reject escalation)",
-                      "live_acceptance": "not yet verified"}, ensure_ascii=False, indent=2))
+                      "limits": execution_limits(settings),
+                      "proxy_configured": any(k != "NO_PROXY" for k in network_environment()),
+                      "live_acceptance": "not checked (offline only)"}, ensure_ascii=False, indent=2))
+
+
+def network_check() -> int:
+    config()  # Keep version/endpoint checks, but never load the credential.
+    try:
+        process = subprocess.run([sys.executable, str(BASE / "runtime-launch.py"), "--network-check"],
+                                 env=clean_environment(), cwd=BASE, capture_output=True,
+                                 text=True, encoding="utf-8", timeout=20)
+        result = json.loads(process.stdout)
+        if not isinstance(result, dict) or result.get("type") != "network-check":
+            raise ValueError("Invalid probe output")
+    except (subprocess.TimeoutExpired, ValueError):
+        result = {"type": "network-check", "reachable": False, "error_code": "PROBE_FAILED",
+                  "credential_sent": False, "paid_model_tasks": 0}
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0 if result.get("reachable") else 2
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("doctor", help="Offline runtime initialization; no model prompt or paid API call")
+    sub.add_parser("network-check", help="Credential-free official endpoint probe; no model request")
     sub.add_parser("set-token", help="Hidden local input, stored with Windows user-scoped DPAPI")
     sub.add_parser("_worker", help=argparse.SUPPRESS)
     run = sub.add_parser("run", help="Execute an explicitly authorized bounded task")
@@ -438,6 +535,8 @@ def main() -> int:
         if args.command == "set-token":
             set_token()
             return 0
+        if args.command == "network-check":
+            return network_check()
         if args.command == "_worker":
             return worker()
         return run_task(args)

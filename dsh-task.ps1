@@ -1,5 +1,5 @@
 param(
-    [ValidateSet('doctor', 'run')][string]$Command = 'doctor',
+    [ValidateSet('doctor', 'network-check', 'run')][string]$Command = 'doctor',
     [string]$Workspace,
     [string]$TaskFile,
     [string]$ContinueFrom
